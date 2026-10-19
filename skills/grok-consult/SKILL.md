@@ -30,13 +30,13 @@ Ask xAI's Grok a question via [grok-companion.mjs](../../scripts/grok-companion.
 
 **Foreground:**
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs consult '<raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" consult '<raw arguments>'
 ```
 If the foreground command is still running after 10 seconds and goes to a background task, wait for the task completion message (do not poll in a loop) and then return its stdout verbatim.
 
 **Background (`--background`):**
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs consult '--background <raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" consult '--background <raw arguments>'
 ```
 Then tell the user to check `/grok-status <id>` and `/grok-result <id>`.
 

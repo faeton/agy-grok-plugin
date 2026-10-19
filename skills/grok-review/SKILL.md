@@ -35,13 +35,13 @@ Run a Grok code review through [grok-companion.mjs](../../scripts/grok-companion
 
 **Foreground:**
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs review '<raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" review '<raw arguments>'
 ```
 If the foreground command is sent to a background task while Grok runs, wait for the task completion notification and then return its stdout verbatim.
 
 **Background (`--background`):**
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs review '--background <raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" review '--background <raw arguments>'
 ```
 Then tell the user: `"Grok review started in the background. Check /grok-status for progress and /grok-result <id> for findings."`
 

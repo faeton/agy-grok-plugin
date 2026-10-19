@@ -17,7 +17,7 @@ Print the stored final output for a finished Grok job via [grok-companion.mjs](.
 2. Call `run_command` with `BypassSandbox: true`, `Cwd` set to the workspace root, and `WaitMsBeforeAsync: 5000`:
 
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs result '<raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" result '<raw arguments>'
 ```
 
 ## Output Rules

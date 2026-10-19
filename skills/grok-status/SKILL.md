@@ -17,7 +17,7 @@ Show active and recent Grok jobs for this workspace via [grok-companion.mjs](../
 2. Call `run_command` with `BypassSandbox: true`, `Cwd` set to the workspace root, and `WaitMsBeforeAsync: 10000`:
 
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs status '<raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" status '<raw arguments>'
 ```
 
 ## Output Rules

@@ -17,7 +17,7 @@ Cancel an active background Grok job in this workspace via [grok-companion.mjs](
 2. Call `run_command` with `BypassSandbox: true`, `Cwd` set to the workspace root, and `WaitMsBeforeAsync: 8000`:
 
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs cancel '<raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" cancel '<raw arguments>'
 ```
 
 ## Output Rules

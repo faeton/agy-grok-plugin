@@ -33,7 +33,7 @@ function resolveGrokBin() {
     resolve(GROK_HOME, "bin", "grok"),
     resolve(homedir(), ".local", "bin", "grok"),
   ]) {
-    const res = spawnSync(candidate, ["--version"], { stdio: "ignore" });
+    const res = spawnSync(candidate, ["--version"], { stdio: "ignore", timeout: 10_000 });
     if (!res.error && res.status === 0) return candidate;
   }
   return "grok";
@@ -246,7 +246,7 @@ export function ensureHostAccess() {
 
 export function getGrokAvailability() {
   ensureHostAccess();
-  const res = spawnSync(GROK_BIN, ["--version"], { encoding: "utf8" });
+  const res = spawnSync(GROK_BIN, ["--version"], { encoding: "utf8", timeout: MODEL_PROBE_TIMEOUT_MS });
   if (res.error || res.status !== 0) {
     return { available: false, version: null };
   }
@@ -507,14 +507,16 @@ export function runGrok(args, options = {}) {
         promptFile = writePromptFile(prompt);
         args = ["--prompt-file", promptFile.path, ...args];
       }
+      // Forced last: an exported GROK_CLAUDE_HOOKS_ENABLED=1 must not re-enable
+      // hooks or MCPs, which run outside the read-only tool allowlist.
       const childEnv = {
+        ...process.env,
         GROK_CLAUDE_SKILLS_ENABLED: "0",
         GROK_CLAUDE_MCPS_ENABLED: "0",
         GROK_CLAUDE_HOOKS_ENABLED: "0",
         GROK_CLAUDE_RULES_ENABLED: "0",
         GROK_CURSOR_SKILLS_ENABLED: "0",
         GROK_CURSOR_MCPS_ENABLED: "0",
-        ...process.env,
       };
       child = spawn(GROK_BIN, args, {
         cwd,
@@ -590,6 +592,10 @@ export function runGrok(args, options = {}) {
     // and silently dropped from onProgress.
     let pending = "";
 
+    // Stateful decoding: a multibyte character split across chunks stays intact.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
     child.stdout.on("data", (buf) => {
       touch();
       const chunk = buf.toString("utf8");
@@ -633,10 +639,10 @@ export function runGrok(args, options = {}) {
       // that ignores SIGTERM and dropped the pipes is still alive. Finish the
       // escalation BEFORE resolving — the old code unref'd the SIGKILL timer,
       // so the companion exited first and the descendant survived.
-      if (killTimer) {
-        clearTimeout(killTimer);
-        await terminateGroups([child.pid], { graceMs });
-      }
+      if (killTimer) clearTimeout(killTimer);
+      // Also after a clean exit: a descendant that closed its pipes can outlive
+      // the leader. No-op when the group is already gone.
+      await terminateGroups([child.pid], { graceMs });
       activeChildren.delete(child);
       resolveRun({ ...result, durationMs: Date.now() - startedAt });
     };

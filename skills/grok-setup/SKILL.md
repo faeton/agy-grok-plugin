@@ -13,7 +13,7 @@ Check whether the local `grok` CLI is installed, authenticated, and ready via [g
 2. Call `run_command` with `BypassSandbox: true`, `Cwd` set to the workspace root, and `WaitMsBeforeAsync: 5000`:
 
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs setup --json
+node "/abs/path/to/scripts/grok-companion.mjs" setup --json
 ```
 
 ## Output Rules

@@ -15,9 +15,9 @@ Always resolve the **literal absolute path** to `grok-companion.mjs` from the pa
 
 ## Primary Helpers (One `run_command` Call Each, Never Chained)
 
-- `node /abs/path/to/scripts/grok-companion.mjs consult '[flags] -- <question>'`
-- `node /abs/path/to/scripts/grok-companion.mjs review '[flags]'`
-- `node /abs/path/to/scripts/grok-companion.mjs adversarial-review '[flags] [focus text]'`
+- `node "/abs/path/to/scripts/grok-companion.mjs" consult '[flags] -- <question>'`
+- `node "/abs/path/to/scripts/grok-companion.mjs" review '[flags]'`
+- `node "/abs/path/to/scripts/grok-companion.mjs" adversarial-review '[flags] [focus text]'`
 
 ## Execution Rules
 

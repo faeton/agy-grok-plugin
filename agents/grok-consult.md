@@ -26,7 +26,7 @@ Make exactly ONE `run_command` call with:
 
 1. **Free-form question (`consult`):**
    ```bash
-   node /abs/path/to/scripts/grok-companion.mjs consult '[flags] -- <question>'
+   node "/abs/path/to/scripts/grok-companion.mjs" consult '[flags] -- <question>'
    ```
    - Everything that is the question goes AFTER `--`.
    - You may tighten a vague request into a concise, adversarial prompt (1–2 sentence question + constraints + desired output shape) before calling `consult`. Do not solve the problem yourself.
@@ -34,13 +34,13 @@ Make exactly ONE `run_command` call with:
 
 2. **Code review of local git state (`review`):**
    ```bash
-   node /abs/path/to/scripts/grok-companion.mjs review '[flags]'
+   node "/abs/path/to/scripts/grok-companion.mjs" review '[flags]'
    ```
    - Supports `--scope auto|working-tree|branch` and `--base <ref>`.
 
 3. **Focused/adversarial code review (`adversarial-review`):**
    ```bash
-   node /abs/path/to/scripts/grok-companion.mjs adversarial-review '[flags] <focus text>'
+   node "/abs/path/to/scripts/grok-companion.mjs" adversarial-review '[flags] <focus text>'
    ```
 
 # Hard Rules

@@ -23,13 +23,13 @@ Run a Grok code review with extra adversarial focus instructions via [grok-compa
 
 **Foreground:**
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs adversarial-review '<raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" adversarial-review '<raw arguments>'
 ```
 If the foreground command is sent to a background task while Grok runs, wait for the task completion notification and then return its stdout verbatim.
 
 **Background (`--background`):**
 ```bash
-node /abs/path/to/scripts/grok-companion.mjs adversarial-review '--background <raw arguments>'
+node "/abs/path/to/scripts/grok-companion.mjs" adversarial-review '--background <raw arguments>'
 ```
 Then tell the user: `"Grok adversarial review started in the background. Check /grok-status for progress and /grok-result <id> for findings."`
 

@@ -41,13 +41,13 @@ This plugin fixes all three:
 agy plugin install https://github.com/faeton/agy-grok-plugin
 
 # Or install from a local checkout
-agy plugin install ~/Sites/agy-grok-plugin
+agy plugin install /path/to/agy-grok-plugin
 ```
 
 ### Inside an interactive `agy` session
 
 ```text
-/plugin install ~/Sites/agy-grok-plugin
+/plugin install /path/to/agy-grok-plugin
 ```
 
 Or register it in `.agents/plugins.json` (workspace) or `~/.gemini/config/plugins.json` (global):
