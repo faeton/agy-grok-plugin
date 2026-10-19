@@ -1,0 +1,772 @@
+// Everything that talks to the `grok` CLI: availability/auth, read-only flag
+// construction, the supervised runner (watchdog + JSON-envelope parsing), and
+// model-capability probing.
+
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+
+// Wall-clock watchdog. Runs that were allowed past the old 8-minute cap have
+// completed cleanly at 8.6min and 10.4min with full answers, so 8 minutes was
+// truncating real work, not catching hangs. Stalls are caught much earlier by
+// the idle timer below; this is only the bounded backstop for a run that keeps
+// talking but never finishes.
+export const DEFAULT_TIMEOUT_MS = 15 * 60_000;
+
+// Kill a run that has produced NO output at all for this long. A stalled relay
+// is silent, so this catches it in minutes instead of burning the full wall
+// clock. Floor is set by grok's documented success path: after the answer it can
+// spend up to 120s draining usage with no events emitted, so anything near that
+// would kill healthy runs just before they finish.
+export const DEFAULT_IDLE_MS = 3 * 60_000;
+
+// grok's own home (models cache, config). Honours GROK_HOME like the CLI does.
+const GROK_HOME = process.env.GROK_HOME
+  ? resolve(process.env.GROK_HOME)
+  : resolve(homedir(), ".grok");
+
+function resolveGrokBin() {
+  if (process.env.GROK_BIN) return process.env.GROK_BIN;
+  for (const candidate of [
+    "grok",
+    resolve(GROK_HOME, "bin", "grok"),
+    resolve(homedir(), ".local", "bin", "grok"),
+  ]) {
+    const res = spawnSync(candidate, ["--version"], { stdio: "ignore" });
+    if (!res.error && res.status === 0) return candidate;
+  }
+  return "grok";
+}
+
+export const GROK_BIN = resolveGrokBin();
+
+// Prompt files are written under a directory with this prefix. It doubles as the
+// marker that identifies our grok process in `ps` before cancel signals it.
+export const PROMPT_DIR_PREFIX = "grok-companion-prompt-";
+
+// Upper bound on the `grok models` probe. It runs synchronously before the
+// run's own watchdogs exist, so it needs its own.
+const MODEL_PROBE_TIMEOUT_MS = 10_000;
+
+// Reasoning effort sent when the caller does not pass --effort. The grok CLI's
+// own default is `high`, which makes routine consults and reviews very slow.
+// Override globally with GROK_PLUGIN_EFFORT, or per call with --effort.
+// GROK_PLUGIN_EFFORT=default sends no flag and lets the CLI pick.
+export const DEFAULT_EFFORT = process.env.GROK_PLUGIN_EFFORT || "medium";
+
+// Compare stopReasons case/separator-insensitively. The CLI switched from
+// PascalCase (`EndTurn`) to the snake_case ACP token (`end_turn`) in 1.0.4,
+// which silently turned every successful run into a reported failure.
+const normReason = (s) => String(s).toLowerCase().replace(/[\s_-]+/g, "");
+
+// Grok produced its answer and stopped cleanly. PascalCase spellings normalize
+// onto these too, so pre-1.0.4 CLIs keep working.
+const GOOD_STOP_REASONS = new Set(["endturn", "stop", "completed"]);
+
+// The run genuinely failed and any text is not a usable answer.
+const BAD_STOP_REASONS = new Set(["cancelled", "refusal"]);
+
+// The run hit a ceiling: whatever text arrived is real but incomplete. Worth
+// surfacing with a warning — discarding a truncated 10k-char analysis is the
+// exact failure mode this classifier exists to prevent.
+//
+// `tool_use` / `pause_turn` as a TURN reason mean the model stopped to call a
+// tool (most likely one the read-only policy then refused) and never wrote its
+// final answer, so the text is a partial analysis, not a finished one.
+const TRUNCATED_STOP_REASONS = new Set([
+  "maxtokens",
+  "maxturns",
+  "maxturnrequests",
+  "maxturnsreached",
+  "tooluse",
+  "pauseturn",
+]);
+
+// grok's docs call the stopReason list explicitly non-exhaustive, so an
+// unrecognized value must not fail closed the way the old allowlist did. Fail
+// open when there is substantial text to hand back, and fail loudly otherwise.
+const UNKNOWN_REASON_MIN_TEXT = 16;
+
+// Decide run outcome from the envelope. Single source of truth: callers must not
+// re-derive `ok` from text/exit code separately.
+export function classifyStopReason(stopReason, text) {
+  const body = (text ?? "").trim();
+  const n = stopReason ? normReason(stopReason) : "";
+
+  if (n === "cancelled") {
+    return {
+      ok: false,
+      errorMessage:
+        "grok stopped early (stopReason=cancelled) — the relay likely cancelled the request. Retry, or lower the request size.",
+    };
+  }
+  if (BAD_STOP_REASONS.has(n)) {
+    return { ok: false, errorMessage: `grok stopped early (stopReason=${stopReason}).` };
+  }
+  if (TRUNCATED_STOP_REASONS.has(n)) {
+    return body
+      ? { ok: true, warning: `Answer is truncated (stopReason=${stopReason}).` }
+      : { ok: false, errorMessage: `grok truncated with no text (stopReason=${stopReason}).` };
+  }
+  if (!n || GOOD_STOP_REASONS.has(n)) {
+    return body
+      ? { ok: true }
+      : {
+          ok: false,
+          errorMessage: "grok returned an empty response (possible relay cancellation).",
+        };
+  }
+  return body.length >= UNKNOWN_REASON_MIN_TEXT
+    ? { ok: true, warning: `Unrecognized stopReason=${stopReason}; answer returned as-is.` }
+    : { ok: false, errorMessage: `Unrecognized stopReason=${stopReason} with no usable text.` };
+}
+
+// Read-only enforcement, in independent layers. Each one alone has had a hole,
+// so none is trusted alone:
+//
+// 1. --tools: an ALLOWLIST of grok's internal tool ids. The old denylist missed
+//    tools it did not know about — grok 1.0.50 ships its file-writing tool as
+//    `write` (not `write_file`), plus scheduler/workflow/monitor/image tools,
+//    all of which stayed available. An allowlist cannot go stale that way.
+//    Verified against grok 1.0.50 via the `available_commands` event: with this
+//    flag the toolset is exactly the listed ids (MCP meta-tools included in the
+//    removal once they are also in --disallowed-tools).
+const READ_TOOLS = ["read_file", "grep", "list_dir"];
+const WEB_TOOLS = ["web_search", "web_fetch"];
+
+// 2. --disallowed-tools: still removes the known mutating ids (it wins over
+//    --tools) as a backstop if a future CLI ignores or widens the allowlist.
+//    `search_tool` / `use_tool` are the MCP meta-tools, which --tools alone
+//    leaves in place. `Agent` blocks subagent spawning.
+const REMOVED_TOOLS = [
+  "run_terminal_cmd",
+  "run_terminal_command",
+  "search_replace",
+  "write",
+  "write_file",
+  "create_file",
+  "apply_patch",
+  "delete_file",
+  "search_tool",
+  "use_tool",
+  "Agent",
+];
+
+// 3. --deny: permission rules use Claude-style capability names, a DIFFERENT
+//    vocabulary from the tool ids above. They gate execution and override any
+//    allow-rules inherited from the user's settings (the original reason Grok
+//    was editing files during consult).
+const DENIED_CAPABILITIES = ["Write", "Edit", "Bash", "MCPTool"];
+
+// 4. --permission-mode dontAsk: anything that would need approval is refused
+//    instead of auto-run, so a tool that slips past every list still cannot act.
+//
+// 5. --sandbox read-only: the OS boundary (Seatbelt / Landlock). Applies to the
+//    whole grok process and everything it spawns — hooks and stdio MCP servers
+//    included — and allows writes only to ~/.grok and temp dirs. If the sandbox
+//    cannot be applied grok merely warns and runs unsandboxed, so runGrok treats
+//    that warning as fatal (see SANDBOX_FAILED).
+//
+//    On Linux the profile also write-denies grok's hook and config files with a
+//    bubblewrap bind-mount, and without `bwrap` grok refuses the profile outright
+//    (SANDBOX_REFUSED). Plain grok runs fine there, so rather than fail every run
+//    the companion drops --sandbox and says so (see sandboxAvailability): layers
+//    1-4 still keep grok's own tools read-only, but hooks and stdio MCP servers
+//    it spawns are no longer OS-confined. GROK_COMPANION_REQUIRE_SANDBOX=1 keeps
+//    the sandbox mandatory instead.
+export const SANDBOX_PROFILE = "read-only";
+const SANDBOX_FAILED = /sandbox could not be applied/i;
+const SANDBOX_REFUSED = /bwrap|bubblewrap|could not enforce its deny list/i;
+const BWRAP_HINT =
+  "On Linux grok needs bubblewrap (`bwrap`) for its read-only sandbox. Install it, " +
+  "or put a standalone `bwrap` binary on PATH (e.g. ~/.local/bin), or unset " +
+  "GROK_COMPANION_REQUIRE_SANDBOX to run without the OS sandbox.";
+
+// Whether grok can apply the read-only sandbox here. Only Linux has a missing
+// dependency to detect; elsewhere the run's own SANDBOX_FAILED check covers it.
+export function sandboxAvailability() {
+  if (process.platform !== "linux") return { available: true, required: true, warning: null };
+  const required = process.env.GROK_COMPANION_REQUIRE_SANDBOX === "1";
+  const res = spawnSync("bwrap", ["--version"], { stdio: "ignore" });
+  if (required || (!res.error && res.status === 0)) {
+    return { available: !res.error && res.status === 0, required: true, warning: null };
+  }
+  return {
+    available: false,
+    required: false,
+    warning:
+      "Ran without grok's OS read-only sandbox: bubblewrap (`bwrap`) is not on PATH. " +
+      "grok's tools are still limited to read-only ones, but its hooks and MCP " +
+      "servers are not OS-confined.",
+  };
+}
+
+// Read-only argv shared by consult and review. `web` toggles web search/fetch
+// (on for consult, off for review); `sandbox: false` omits --sandbox when
+// sandboxAvailability() says it cannot be applied.
+export function readOnlyArgs({ web = true, sandbox = true } = {}) {
+  const args = [
+    "--tools",
+    [...READ_TOOLS, ...(web ? WEB_TOOLS : [])].join(","),
+    "--disallowed-tools",
+    REMOVED_TOOLS.join(","),
+    "--permission-mode",
+    "dontAsk",
+    ...(sandbox ? ["--sandbox", SANDBOX_PROFILE] : []),
+    "--no-subagents",
+    "--no-memory",
+  ];
+  for (const capability of DENIED_CAPABILITIES) {
+    args.push("--deny", capability);
+  }
+  if (!web) {
+    args.push("--disable-web-search", "--deny", "WebFetch", "--deny", "WebSearch");
+  }
+  return args;
+}
+
+// Detect when grok-companion is invoked inside Antigravity's outer terminal
+// sandbox (BypassSandbox: false), where Seatbelt/Landlock blocks reading
+// ~/.grok with EPERM/EACCES. Throwing here with "Operation not permitted"
+// prevents `setup` or `consult` from falsely reporting that grok is missing or
+// logged out, and triggers Antigravity's sandbox-error retry hint.
+export function ensureHostAccess() {
+  if (!existsSync(GROK_HOME)) return;
+  try {
+    readdirSync(GROK_HOME);
+  } catch (err) {
+    if (err && (err.code === "EPERM" || err.code === "EACCES")) {
+      throw new Error(
+        `Operation not permitted reading ${GROK_HOME} (${err.code}): grok-companion is blocked by the outer terminal sandbox. Re-run with BypassSandbox: true so grok can access ~/.grok, reach xAI's API, and apply its own read-only sandbox.`,
+      );
+    }
+  }
+}
+
+export function getGrokAvailability() {
+  ensureHostAccess();
+  const res = spawnSync(GROK_BIN, ["--version"], { encoding: "utf8" });
+  if (res.error || res.status !== 0) {
+    return { available: false, version: null };
+  }
+  return { available: true, version: res.stdout.trim() };
+}
+
+// Auth heuristic: ~/.grok/auth.json exists and is non-empty.
+export function getGrokAuthStatus() {
+  ensureHostAccess();
+  try {
+    const raw = readFileSync(resolve(GROK_HOME, "auth.json"), "utf8");
+    const json = JSON.parse(raw);
+    const loggedIn = Boolean(json && Object.keys(json).length > 0);
+    return { loggedIn };
+  } catch (err) {
+    if (err && (err.code === "EPERM" || err.code === "EACCES")) {
+      throw new Error(
+        `Operation not permitted reading ${GROK_HOME}/auth.json (${err.code}): re-run grok-companion with BypassSandbox: true.`,
+      );
+    }
+    return { loggedIn: false };
+  }
+}
+
+export function detectDefaultModel() {
+  const res = spawnSync(GROK_BIN, ["models"], {
+    encoding: "utf8",
+    timeout: MODEL_PROBE_TIMEOUT_MS,
+  });
+  if (res.error || res.status !== 0) return null;
+  const m = res.stdout.match(/Default model:\s*(\S+)/);
+  return m ? m[1] : null;
+}
+
+// Returns true/false from grok's models cache, or null when it cannot tell
+// (no cache, unreadable cache, or a model id the cache does not list).
+export function modelSupportsReasoningEffort(modelId) {
+  try {
+    const cachePath = resolve(GROK_HOME, "models_cache.json");
+    const cache = JSON.parse(readFileSync(cachePath, "utf8"));
+    const entry = cache.models?.[modelId];
+    if (!entry) return null;
+    return Boolean(entry.info?.supports_reasoning_effort);
+  } catch {
+    return null;
+  }
+}
+
+// Build the effort-related argv. Returns { args, dropped } where dropped is a
+// message or null. When neither flag is given, DEFAULT_EFFORT applies.
+//
+// The flag is dropped ONLY when the cache positively says the model lacks
+// support (the API 400s on the knob then). Unknown support sends it: treating
+// "unknown" as "unsupported" meant a cold or stale cache silently fell back to
+// the CLI's slow `high` default — the very thing DEFAULT_EFFORT exists to stop.
+// --effort and --reasoning-effort are aliases in the CLI, so only one is sent.
+export function effortArgs({ effort, reasoningEffort, model }) {
+  const explicit = Boolean(effort || reasoningEffort);
+  let level = effort || reasoningEffort || DEFAULT_EFFORT;
+  if (level === "default") level = null;
+  if (!level) return { args: [], dropped: null };
+  const targetModel = model || detectDefaultModel();
+  const supported = targetModel ? modelSupportsReasoningEffort(targetModel) : null;
+  if (supported !== false) return { args: ["--effort", level], dropped: null };
+  if (!explicit) return { args: [], dropped: null };
+  return {
+    args: [],
+    dropped: `${targetModel} does not support reasoning effort — dropped --effort ${level}.`,
+  };
+}
+
+// grok is spawned detached, so it leads its own process group and every signal
+// goes to the group: a descendant is never left behind holding the repo.
+export function signalGroup(pid, signal) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  try {
+    process.kill(-pid, signal); // negative pid = process group
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+function probe(target) {
+  try {
+    process.kill(target, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+
+// True while the group led by `pid` — or, for a process that is not a group
+// leader (a foreground companion), the process itself — is still around.
+export function groupAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  return probe(-pid) || probe(pid);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// SIGTERM each group, wait up to graceMs for them to go, SIGKILL whatever is
+// left — and only resolve once that is done. Every abort path (watchdog, idle,
+// cancel, Ctrl-C) goes through here, so escalation cannot be skipped by the
+// caller exiting early.
+export async function terminateGroups(pids, { graceMs = 5_000 } = {}) {
+  const live = pids.filter((pid) => groupAlive(pid));
+  for (const pid of live) signalGroup(pid, "SIGTERM");
+  const deadline = Date.now() + graceMs;
+  while (live.some(groupAlive) && Date.now() < deadline) await sleep(100);
+  for (const pid of live) if (groupAlive(pid)) signalGroup(pid, "SIGKILL");
+}
+
+// Live grok children of this process, so a signal handler can tear them down
+// (otherwise the detached grok group would orphan when the companion dies).
+const activeChildren = new Set();
+
+export function terminateActiveGrok(options) {
+  return terminateGroups(
+    [...activeChildren].map((child) => child.pid),
+    options,
+  );
+}
+
+// Write the prompt to a private temp file for --prompt-file. Passing it as a
+// `-p` argument fails with E2BIG once a review diff passes the OS argv limit
+// (~256KB on macOS). Lives outside the repo; the read-only sandbox can read it.
+function writePromptFile(prompt) {
+  const dir = mkdtempSync(join(tmpdir(), PROMPT_DIR_PREFIX));
+  const path = join(dir, "prompt.md");
+  writeFileSync(path, prompt, { encoding: "utf8", mode: 0o600 });
+  return { dir, path };
+}
+
+// Parse grok's output envelope: { text, stopReason, sessionId, thought, ... }.
+//
+// Two wire formats end up here:
+//
+//   --output-format json            one JSON object, the whole answer at once
+//   --output-format streaming-json  NDJSON, one `type`-tagged ACP event per line
+//
+// The streaming form needs real accumulation, not a last-wins merge: answer text
+// arrives as a SEQUENCE of {"type":"text","data":"..."} chunks that must be
+// concatenated. Only the final {"type":"end"} event carries the turn stopReason;
+// the per-response `usage` line reports the raw provider reason (`tool_use`,
+// `pause_turn`) mid-loop, so treating it as the turn result would classify a
+// working agent as a failure.
+function parseEnvelope(stdout) {
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+  try {
+    const single = JSON.parse(trimmed);
+    // A lone type-tagged event is still a stream (one-line edge case).
+    if (single && typeof single === "object" && single.type === undefined) {
+      return single;
+    }
+  } catch {
+    /* not a single object — fall through to the stream reader */
+  }
+
+  const text = [];
+  const thought = [];
+  const meta = {};
+  let sawEvent = false;
+  let legacy = null;
+
+  for (const line of trimmed.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    let obj;
+    try {
+      obj = JSON.parse(t);
+    } catch {
+      continue;
+    }
+    if (obj == null || typeof obj !== "object") continue;
+
+    switch (obj.type) {
+      case "text":
+        sawEvent = true;
+        if (typeof obj.data === "string") text.push(obj.data);
+        break;
+      case "thought":
+        sawEvent = true;
+        if (typeof obj.data === "string") thought.push(obj.data);
+        break;
+      case "end":
+        // Authoritative: always the last event of the turn.
+        sawEvent = true;
+        if (obj.stopReason !== undefined) meta.stopReason = obj.stopReason;
+        if (obj.sessionId !== undefined) meta.sessionId = obj.sessionId;
+        meta.sawEnd = true;
+        break;
+      case "error":
+        sawEvent = true;
+        if (obj.message) meta.errorEvent = String(obj.message);
+        break;
+      case undefined:
+        // Pre-1.0.4 shape: bare {text, stopReason, ...} objects across lines.
+        if (obj.text !== undefined) legacy = { ...(legacy ?? {}), ...obj };
+        for (const key of ["stopReason", "sessionId", "thought"]) {
+          if (obj[key] !== undefined) meta[key] = obj[key];
+        }
+        break;
+      default:
+        // usage / tool_call / plan / auto_compact_* / anything future: the docs
+        // call this list non-exhaustive, so ignore rather than guess. Notably
+        // `usage.stopReason` is per-response and must NOT become the turn's.
+        sawEvent = true;
+        break;
+    }
+  }
+
+  if (legacy && !text.length) return { ...meta, ...legacy };
+  if (sawEvent || text.length) {
+    // `streamed` lets the runner tell "no end event because this is the
+    // single-object json format" from "no end event because the stream was cut".
+    return {
+      ...meta,
+      streamed: true,
+      text: text.join(""),
+      thought: thought.join("") || null,
+    };
+  }
+  return Object.keys(meta).length ? meta : null;
+}
+
+// Run `grok` under supervision. Resolves (never rejects) with a normalized
+// result so callers can record a clean failure instead of hanging.
+//
+//   args        argv passed to grok (must include --output-format)
+//   prompt      prompt text, delivered via --prompt-file (or put -p in args)
+//   cwd         working directory
+//   timeoutMs   wall-clock backstop
+//   idleMs      kill after this long with no output at all (0 disables)
+//   graceMs     SIGTERM -> SIGKILL escalation window
+//   onProgress  optional (event) => void for streaming-json lines
+export function runGrok(args, options = {}) {
+  const {
+    prompt,
+    cwd = process.cwd(),
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    idleMs = DEFAULT_IDLE_MS,
+    graceMs = 5_000,
+    onProgress,
+    onSpawn,
+  } = options;
+
+  return new Promise((resolveRun) => {
+    const startedAt = Date.now();
+    let promptFile = null;
+    let child;
+    try {
+      if (prompt !== undefined) {
+        promptFile = writePromptFile(prompt);
+        args = ["--prompt-file", promptFile.path, ...args];
+      }
+      const childEnv = {
+        GROK_CLAUDE_SKILLS_ENABLED: "0",
+        GROK_CLAUDE_MCPS_ENABLED: "0",
+        GROK_CLAUDE_HOOKS_ENABLED: "0",
+        GROK_CLAUDE_RULES_ENABLED: "0",
+        GROK_CURSOR_SKILLS_ENABLED: "0",
+        GROK_CURSOR_MCPS_ENABLED: "0",
+        ...process.env,
+      };
+      child = spawn(GROK_BIN, args, {
+        cwd,
+        env: childEnv,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (err) {
+      resolveRun({
+        ok: false,
+        exitCode: 127,
+        signal: null,
+        timedOut: false,
+        text: "",
+        stopReason: null,
+        sessionId: null,
+        thought: null,
+        stderr: "",
+        errorMessage: `Failed to spawn grok: ${err.message}`,
+        durationMs: 0,
+        raw: null,
+      });
+      if (promptFile) rmSync(promptFile.dir, { recursive: true, force: true });
+    }
+    if (!child) return;
+    activeChildren.add(child);
+    onSpawn?.({ pid: child.pid });
+
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let idledOut = false;
+    let sandboxFailed = false;
+    let killTimer = null;
+    let idleTimer = null;
+
+    const abort = () => {
+      if (killTimer) return;
+      signalGroup(child.pid, "SIGTERM");
+      killTimer = setTimeout(() => signalGroup(child.pid, "SIGKILL"), graceMs);
+    };
+
+    const watchdog = setTimeout(() => {
+      timedOut = true;
+      // Disarm idle before aborting. Otherwise an idle timer armed shortly
+      // before the wall-clock deadline can still fire during the SIGTERM grace
+      // window and flip idledOut, reporting a wall-clock timeout as a stall.
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+      abort();
+    }, timeoutMs);
+
+    // Idle detection. A stalled relay returns nothing at all, so any byte on
+    // either pipe counts as liveness — parsing a JSON event is not required and
+    // would miss tool-call chatter that proves the run is alive.
+    const touch = () => {
+      if (!idleMs || timedOut || idledOut) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (timedOut) return; // wall-clock already won the race
+        idledOut = true;
+        timedOut = true;
+        clearTimeout(watchdog);
+        abort();
+      }, idleMs);
+    };
+    touch();
+
+    // Carries the trailing partial line between chunks. A JSON event split
+    // across a socket read would otherwise be parsed as two invalid fragments
+    // and silently dropped from onProgress.
+    let pending = "";
+
+    child.stdout.on("data", (buf) => {
+      touch();
+      const chunk = buf.toString("utf8");
+      stdout += chunk;
+      if (!onProgress) return;
+      pending += chunk;
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? ""; // last element is incomplete until a newline
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t) continue;
+        try {
+          onProgress(JSON.parse(t));
+        } catch {
+          /* not a json line */
+        }
+      }
+    });
+    child.stderr.on("data", (buf) => {
+      touch();
+      stderr += buf.toString("utf8");
+      // grok prints this and then carries on WITHOUT the sandbox. Read-only must
+      // fail closed, so kill the run before it gets to any tool call.
+      if (!sandboxFailed && SANDBOX_FAILED.test(stderr)) {
+        sandboxFailed = true;
+        clearTimeout(watchdog);
+        if (idleTimer) clearTimeout(idleTimer);
+        abort();
+      }
+    });
+
+    let finished = false;
+    const finish = async (result) => {
+      // `error` and `close` can both fire for one child.
+      if (finished) return;
+      finished = true;
+      clearTimeout(watchdog);
+      if (idleTimer) clearTimeout(idleTimer);
+      if (promptFile) rmSync(promptFile.dir, { recursive: true, force: true });
+      // The group leader closing does not mean the group is gone: a descendant
+      // that ignores SIGTERM and dropped the pipes is still alive. Finish the
+      // escalation BEFORE resolving — the old code unref'd the SIGKILL timer,
+      // so the companion exited first and the descendant survived.
+      if (killTimer) {
+        clearTimeout(killTimer);
+        await terminateGroups([child.pid], { graceMs });
+      }
+      activeChildren.delete(child);
+      resolveRun({ ...result, durationMs: Date.now() - startedAt });
+    };
+
+    child.on("error", (err) => {
+      finish({
+        ok: false,
+        exitCode: 127,
+        signal: null,
+        timedOut,
+        text: "",
+        stopReason: null,
+        sessionId: null,
+        thought: null,
+        stderr,
+        errorMessage: `Failed to spawn grok: ${err.message}`,
+        raw: null,
+      });
+    });
+
+    child.on("close", (code, signal) => {
+      const envelope = parseEnvelope(stdout);
+      const text = (envelope?.text ?? (envelope ? "" : stdout)).trim();
+      const stopReason = envelope?.stopReason ?? null;
+
+      let ok;
+      let errorMessage = null;
+      let warning = null;
+      // A turn that emitted `end` plus text is finished, and stays finished even
+      // if the process then lingered and got killed. Checked first so a complete
+      // answer is never thrown away as a "stall" — the whole point of this file.
+      const completeTurn = Boolean(envelope?.streamed && envelope.sawEnd && text);
+      if (sandboxFailed) {
+        ok = false;
+        errorMessage =
+          `grok could not apply the ${SANDBOX_PROFILE} sandbox, so the run was stopped ` +
+          `rather than continue unsandboxed: ${firstStderrLine(stderr)}`;
+      } else if (!completeTurn && code !== 0 && SANDBOX_REFUSED.test(stderr)) {
+        // grok refused to start the profile at all (Linux without bwrap).
+        ok = false;
+        sandboxFailed = true;
+        errorMessage = `${firstStderrLine(stderr)} ${BWRAP_HINT}`;
+      } else if (completeTurn) {
+        const verdict = classifyStopReason(stopReason, text);
+        ok = verdict.ok;
+        warning = verdict.warning ?? null;
+        errorMessage = verdict.ok
+          ? null
+          : firstStderrLine(stderr) || verdict.errorMessage;
+        if (ok && (idledOut || timedOut)) {
+          warning = warning
+            ? `${warning} (Process was killed after the answer completed.)`
+            : "Answer completed, but the process had to be killed afterwards.";
+        }
+      } else if (idledOut) {
+        ok = false;
+        errorMessage =
+          `No output from grok for ${Math.round(idleMs / 1000)}s — the relay stalled. ` +
+          `Retry, or lower the request size.`;
+      } else if (timedOut) {
+        ok = false;
+        errorMessage = `Timed out after ${timeoutMs}ms (no response from grok).`;
+      } else if (code !== 0) {
+        ok = false;
+        // An `error` event carries grok's own description of the failure, which
+        // beats a generic exit-code message or an unrelated stderr line.
+        errorMessage =
+          envelope?.errorEvent ||
+          firstStderrLine(stderr) ||
+          `grok exited with code ${code}.`;
+      } else if (envelope?.errorEvent) {
+        // An explicit error with no `end` after it is a failed run, even when
+        // some commentary arrived first. The text is kept as partial output.
+        ok = false;
+        errorMessage = envelope.errorEvent;
+      } else if (envelope?.streamed && envelope.sawEnd) {
+        // A complete turn: classify on its stopReason even if the process then
+        // lingered. Checked before the truncation branch so a finished answer is
+        // never relabelled as a cut stream.
+        const verdict = classifyStopReason(stopReason, text);
+        ok = verdict.ok;
+        warning = verdict.warning ?? null;
+        errorMessage = verdict.ok
+          ? null
+          : firstStderrLine(stderr) || verdict.errorMessage;
+      } else if (envelope?.streamed && !envelope.sawEnd) {
+        // grok documents `end` as always the last event of a turn. Exit 0 with
+        // no `end` means the stream was cut mid-answer, so whatever text we have
+        // is incomplete. That is a failure — "exit 0 + some text" stored as a
+        // completed job is exactly the silent truncation this runner exists to
+        // catch — but the text is kept and shown as partial output.
+        ok = false;
+        errorMessage = text
+          ? "Stream ended without a final event — the answer is incomplete."
+          : firstStderrLine(stderr) ||
+            "grok produced no output and the stream ended without a final event.";
+      } else {
+        const verdict = classifyStopReason(stopReason, text);
+        ok = verdict.ok;
+        warning = verdict.warning ?? null;
+        errorMessage = verdict.ok
+          ? null
+          : firstStderrLine(stderr) || verdict.errorMessage;
+      }
+
+      finish({
+        ok,
+        warning,
+        exitCode: timedOut ? 124 : code ?? 1,
+        signal,
+        timedOut,
+        idledOut,
+        sandboxFailed,
+        text,
+        stopReason,
+        sessionId: envelope?.sessionId ?? null,
+        thought: envelope?.thought ?? null,
+        stderr,
+        errorMessage,
+        raw: envelope,
+      });
+    });
+  });
+}
+
+function firstStderrLine(stderr) {
+  const line = String(stderr ?? "")
+    .split(/\r?\n/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .find((s) => !s.startsWith("[grok-companion]"));
+  return line ?? "";
+}

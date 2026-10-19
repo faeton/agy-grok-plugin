@@ -1,0 +1,13 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "grok",
+  "displayName": "Grok",
+  "version": "0.5.1",
+  "description": "Consult xAI's Grok CLI from Google Antigravity for a strictly read-only second opinion or code review.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Ask Grok for a read-only second opinion on this architecture",
+    "Run a read-only Grok code review on my working tree changes",
+    "Run an adversarial Grok review hunting for race conditions"
+  ]
+}

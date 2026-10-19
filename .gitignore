@@ -1,0 +1,8 @@
+node_modules/
+*.log
+*.jsonl
+*.tmp
+.DS_Store
+logs/
+# agy editor sidecars
+*.metadata.json
