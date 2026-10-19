@@ -9,11 +9,11 @@ Ask xAI's Grok a question via [grok-companion.mjs](../../scripts/grok-companion.
 
 ## Argument Shape
 
-`[--wait|--background] [--model <id>] [--effort <low|medium|high|xhigh|max>] [--file <path>]... -- <question>`
+`[--wait|--background] [--profile fast|thrifty|deep] [--model <id>] [--effort <low|medium|high|xhigh|max>] [--file <path>]... -- <question>`
 
 - Everything after `--` is the question text.
 - `--file <path>` (repeatable) attaches a file as context. Resolve paths relative to the current working directory.
-- `--model`, `--effort`, `--reasoning-effort` are passed through to Grok. The companion drops effort flags automatically if the target model does not support them.
+- `--profile`, `--model`, `--effort`, `--reasoning-effort` are passed through to Grok. The companion drops effort flags automatically if the target model does not support them.
 - If you cannot tell the question from the flags (no `--` separator and it is ambiguous), use `ask_question` once to clarify.
 
 ## Execution Mode

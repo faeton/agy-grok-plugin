@@ -94,23 +94,25 @@ In Antigravity, every bundled skill is available both as a **slash command** and
 ### Common flags
 
 - `--background` — run as a tracked detached job; read it back with `/grok-status` / `/grok-result`. (Foreground is the default for small asks.)
-- `--model <id>` — pin a specific Grok model.
-- `--effort <low|medium|high|xhigh|max>` — reasoning effort, on `consult`, `review` and `adversarial-review`. **Defaults to `medium`** (the grok CLI's own default is `high`, which is very slow for routine asks). Automatically dropped if the target model doesn't support it (so it never 400s).
+- `--profile fast|thrifty|deep` — model + effort preset. **Defaults to `fast`** (`grok-4.7-build-fast` at `low`: a typical review in about a minute). `thrifty` is `grok-4.7` at `low` (about twice as slow, about half the subscription allowance); `deep` is `grok-4.7` at `medium` (4-15 minutes).
+- `--model <id>` / `--effort <low|medium|high|xhigh|max>` — override the profile. Effort is dropped automatically if the target model does not support it (so it never 400s).
 - `--scope auto|working-tree|branch` and `--base <ref>` — for reviews.
-- `--timeout-ms <ms>` — wall-clock backstop (default 15 minutes; must be > 0).
+- `--timeout-ms <ms>` — wall-clock backstop (default 8 minutes; must be > 0).
 - `--idle-ms <ms>` — kill a run that produces no output at all for this long (default 3 minutes). Catches a stalled relay long before the backstop. Don't set it much lower: Grok can spend up to 120s draining usage after the answer without emitting anything.
 
-### Changing the default effort
+### Changing the defaults
 
-Per call, pass `--effort`, e.g. `/grok-review --effort high`.
+Per call, pass `--profile`, `--model` or `--effort`, e.g. `/grok-review --profile deep`.
 
-To change the default for every call, export `GROK_PLUGIN_EFFORT` in your shell profile (`~/.zshrc`):
+To change the default for every call, export it in your shell profile (`~/.zshrc`):
 
 ```bash
-export GROK_PLUGIN_EFFORT="high"
+export GROK_PLUGIN_PROFILE="thrifty"   # or GROK_PLUGIN_MODEL / GROK_PLUGIN_EFFORT
 ```
 
-Use `"default"` to send no effort flag and let the `grok` CLI decide.
+Precedence, highest first: `--model` / `--effort`, `--profile`, `GROK_PLUGIN_MODEL` / `GROK_PLUGIN_EFFORT`, `GROK_PLUGIN_PROFILE`, then `fast`. Use `"default"` for a model or effort to send no flag and let the `grok` CLI decide.
+
+Reviews also inline the full text of changed files (150 KB budget, lockfiles and minified files skipped; `GROK_PLUGIN_INLINE_BYTES` changes it), and grok runs with a lean environment: Claude Code / Cursor skills, MCP servers and hooks are not loaded.
 
 ### Examples
 

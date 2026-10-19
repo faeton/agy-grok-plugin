@@ -9,10 +9,10 @@ Run a Grok code review with extra adversarial focus instructions via [grok-compa
 
 ## Argument Shape
 
-`[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--effort <low|medium|high|xhigh|max>] [focus text]`
+`[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--profile fast|thrifty|deep] [--model <id>] [--effort <low|medium|high|xhigh|max>] [focus text]`
 
 - Any non-flag text is the focus instruction for the reviewer (e.g. `"hunt for race conditions in the new worker pool"`). It is forwarded as the trailing positional text.
-- `--scope`, `--base`, `--model`, `--effort` pass through.
+- `--scope`, `--base`, `--profile`, `--model`, `--effort` pass through.
 - Execution mode (`--wait` / `--background` / estimate size and call `ask_question` once) follows the exact same rules as [grok-review](../grok-review/SKILL.md).
 
 ## Running the Companion

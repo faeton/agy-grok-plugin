@@ -20,5 +20,5 @@ Forward the user's request to the `grok-consult` custom subagent (xAI Grok).
    - `Workspace`: `"inherit"`
    - `Prompt`: Forward the user's request (plus the literal absolute path to [grok-companion.mjs](../../scripts/grok-companion.mjs) resolved relative to this `SKILL.md` file so the subagent can run it immediately in one step).
 2. Do not answer the question or perform the review yourself — the subagent forwards it to Grok.
-3. `--file <path>` and any `--effort` / `--model` flags are for Grok — leave them in the forwarded text so the subagent passes them through (strip `--wait` / `--background` from the forwarded text, since the subagent itself runs asynchronously via `invoke_subagent`).
+3. `--file <path>` and any `--profile` / `--effort` / `--model` flags are for Grok — leave them in the forwarded text so the subagent passes them through (strip `--wait` / `--background` from the forwarded text, since the subagent itself runs asynchronously via `invoke_subagent`).
 4. When the subagent replies, return its output verbatim. Do not paraphrase, summarize, or act on Grok's findings in this turn.

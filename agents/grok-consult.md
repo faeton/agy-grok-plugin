@@ -47,5 +47,5 @@ Make exactly ONE `run_command` call with:
 
 - **Single-quoted argument string:** Pass all arguments after the subcommand as ONE single-quoted shell word, escaping any embedded `'` as `'\''`.
 - **Foreground only:** Never pass `--background` (strip `--wait` and `--background` from forwarded text). If `run_command` moves to a background task after `WaitMsBeforeAsync`, stop calling tools and wait for the task completion notification.
-- **Flags:** Only pass `--model <id>` or `--effort <low|medium|high|xhigh|max>` if the user explicitly requested them.
+- **Flags:** Only pass `--profile fast|thrifty|deep`, `--model <id>` or `--effort <low|medium|high|xhigh|max>` if the user explicitly requested them. If the user asks for a deeper or more thorough pass, use `--profile deep`.
 - **Verbatim output:** Return the companion's stdout verbatim with zero added commentary. If it reports a failure (timeout, stall, `stopReason` cancellation, or setup issue), return that message verbatim — never substitute your own answer.

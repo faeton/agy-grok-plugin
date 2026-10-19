@@ -9,9 +9,9 @@ Run a Grok code review through [grok-companion.mjs](../../scripts/grok-companion
 
 ## Argument Shape
 
-`[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--effort <low|medium|high|xhigh|max>]`
+`[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--profile fast|thrifty|deep] [--model <id>] [--effort <low|medium|high|xhigh|max>]`
 
-- Preserve the user's arguments (`--scope`, `--base`, `--model`, `--effort` pass through to the companion).
+- Preserve the user's arguments (`--scope`, `--base`, `--profile`, `--model`, `--effort` pass through to the companion).
 - `/grok-review` does not take focus text. For focused/adversarial framing use `/grok-adversarial-review`.
 
 ## Execution Mode Rules
