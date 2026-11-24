@@ -18,6 +18,7 @@ import {
   logFilePath,
   readJobFile,
   updateJob,
+  removeJobs,
   listJobs,
   pidAlive,
 } from "./state.mjs";
@@ -60,16 +61,44 @@ export function appendLogBlock(logFile, title, body) {
 
 // Apply `patch` (an object, or a fn of the current record) only while the job's
 // status is one of `from`. Returns { job, changed }.
-export function transition(workspaceRoot, jobId, from, patch) {
+export function transition(workspaceRoot, jobId, from, patch, lockOptions) {
   const allowed = new Set(from);
-  return updateJob(workspaceRoot, jobId, (current) => {
-    if (!current || !allowed.has(current.status)) return null;
-    const delta = typeof patch === "function" ? patch(current) : patch;
-    return delta ? { ...current, ...delta } : null;
-  });
+  return updateJob(
+    workspaceRoot,
+    jobId,
+    (current) => {
+      if (!current || !allowed.has(current.status)) return null;
+      const delta = typeof patch === "function" ? patch(current) : patch;
+      return delta ? { ...current, ...delta } : null;
+    },
+    lockOptions,
+  );
+}
+
+// Progress updates run inside grok's stdout handler, where waiting on the lock
+// stops the pipe being read. They are advisory, so they give up quickly.
+const PROGRESS_LOCK = { timeoutMs: 500 };
+
+// Finished jobs kept per workspace. Each record holds the full prompt request
+// and answer, and every state change rewrites the index, so without a cap both
+// grew for as long as the plugin was used.
+export const MAX_FINISHED_JOBS = 50;
+
+// Drop the oldest finished jobs beyond the cap. Active jobs are never removed.
+export function pruneJobs(workspaceRoot, keep = MAX_FINISHED_JOBS) {
+  try {
+    return removeJobs(workspaceRoot, (jobs) =>
+      sortJobsNewestFirst(jobs.filter((j) => TERMINAL_STATUSES.has(j.status)))
+        .slice(keep)
+        .map((j) => j.id),
+    );
+  } catch {
+    return []; // housekeeping must never block a new job
+  }
 }
 
 export function createJob({ workspaceRoot, kind, kindLabel, title, summary, prefix, request }) {
+  pruneJobs(workspaceRoot);
   const id = generateJobId(prefix ?? "grok");
   const sessionId = currentSessionId();
   const logFile = logFilePath(workspaceRoot, id);
@@ -113,12 +142,19 @@ export async function runTrackedJob(job, runner, { onProgress } = {}) {
 
   try {
     const execution = await runner((event) => {
-      const patch = {};
-      if (event?.phase) patch.phase = event.phase;
-      if (event?.grokPid) patch.grokPid = event.grokPid;
-      if (Object.keys(patch).length) transition(workspaceRoot, id, ["running"], patch);
-      if (event?.message) appendLog(running.logFile, event.message);
-      onProgress?.(event);
+      // Called from inside grok's stdout handler. A lock timeout or a failed
+      // write here must not throw into it: that would kill this process and
+      // orphan the detached grok run. A missed progress update is harmless.
+      try {
+        const patch = {};
+        if (event?.phase) patch.phase = event.phase;
+        if (event?.grokPid) patch.grokPid = event.grokPid;
+        if (Object.keys(patch).length) transition(workspaceRoot, id, ["running"], patch, PROGRESS_LOCK);
+        if (event?.message) appendLog(running.logFile, event.message);
+        onProgress?.(event);
+      } catch (error) {
+        appendLog(running.logFile, `Progress update failed: ${error?.message ?? error}`);
+      }
     });
 
     const finished = transition(workspaceRoot, id, ["running"], {

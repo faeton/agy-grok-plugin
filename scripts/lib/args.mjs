@@ -124,7 +124,9 @@ export function splitRawArgumentString(raw) {
         i++;
         continue;
       }
-      if (ch === "\\" && quote !== "'") {
+      // A backslash escapes only a quote, another backslash or whitespace.
+      // Anywhere else it is text (a regex, a Windows path) and is kept.
+      if (ch === "\\" && quote !== "'" && i + 1 < n && /["'\\\s]/.test(text[i + 1])) {
         escaped = true;
         i++;
         continue;
@@ -135,7 +137,12 @@ export function splitRawArgumentString(raw) {
         i++;
         continue;
       }
-      if (ch === '"' || ch === "'") {
+      // An apostrophe after a letter or digit ("doesn't", "dogs'") is text, not
+      // an opening quote; after anything else (src/'my file.ts') it still
+      // quotes. A quote with no closing partner is text too.
+      const apostrophe = ch === "'" && /[\p{L}\p{N}]$/u.test(token);
+      const closes = text.indexOf(ch, i + 1) !== -1;
+      if ((ch === '"' || ch === "'") && !apostrophe && closes) {
         quote = ch;
         i++;
         continue;

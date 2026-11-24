@@ -320,9 +320,18 @@ export function getGrokAvailability() {
   return { available: true, version: res.stdout.trim() };
 }
 
-// Auth heuristic: ~/.grok/auth.json exists and is non-empty.
+// Auth status. The CLI's own word comes first: `grok models` opens with "You
+// are logged in…" or "You are not authenticated." A non-empty auth.json alone
+// reported "logged in" for an expired session. The file is the fallback when
+// the probe fails or says neither (an older CLI, or no network).
 export function getGrokAuthStatus() {
   ensureHostAccess();
+  const probe = spawnSync(GROK_BIN, ["models"], { encoding: "utf8", timeout: MODEL_PROBE_TIMEOUT_MS });
+  if (!probe.error) {
+    const said = `${probe.stdout ?? ""}\n${probe.stderr ?? ""}`;
+    if (/not authenticated|not logged in/i.test(said)) return { loggedIn: false };
+    if (/you are logged in/i.test(said)) return { loggedIn: true };
+  }
   try {
     const raw = readFileSync(resolve(GROK_HOME, "auth.json"), "utf8");
     const json = JSON.parse(raw);
@@ -604,7 +613,11 @@ export function runGrok(args, options = {}) {
     }
     if (!child) return;
     activeChildren.add(child);
-    onSpawn?.({ pid: child.pid });
+    try {
+      onSpawn?.({ pid: child.pid });
+    } catch {
+      /* recording the pid is advisory; the run itself must still be supervised */
+    }
 
     let stdout = "";
     let stderr = "";
@@ -659,13 +672,8 @@ export function runGrok(args, options = {}) {
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
 
-    // Stateful decoding: a multibyte character split across chunks stays intact.
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-
-    child.stdout.on("data", (buf) => {
+    child.stdout.on("data", (chunk) => {
       touch();
-      const chunk = buf.toString("utf8");
       stdout += chunk;
       pending += chunk;
       const lines = pending.split(/\r?\n/);
@@ -681,12 +689,19 @@ export function runGrok(args, options = {}) {
         }
         activity.lastEventAt = Date.now();
         if (event?.type === "tool_call") activity.toolCalls++;
-        onProgress?.(event);
+        // A throwing progress callback must not escape this event handler: an
+        // uncaught exception here kills the companion and leaves the detached
+        // grok group running with no watchdog.
+        try {
+          onProgress?.(event);
+        } catch {
+          /* progress is advisory */
+        }
       }
     });
-    child.stderr.on("data", (buf) => {
+    child.stderr.on("data", (chunk) => {
       touch();
-      stderr += buf.toString("utf8");
+      stderr += chunk;
       // grok prints this and then carries on WITHOUT the sandbox. Read-only must
       // fail closed, so kill the run before it gets to any tool call.
       if (!sandboxFailed && SANDBOX_FAILED.test(stderr)) {

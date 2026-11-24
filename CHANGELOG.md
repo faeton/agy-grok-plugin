@@ -4,6 +4,24 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] — 2026-11-23
+
+### Fixed
+
+- A review started in a subdirectory now sees untracked files anywhere in the repository (it could report "No changes detected").
+- A question passed as a single argument keeps its apostrophes and backslashes.
+- A review with nothing to review completes and exits 0 instead of failing with exit 1.
+- A failed or slow progress write no longer kills the companion and orphans the running `grok`; progress writes give up after 0.5s.
+- Stale-lock reclaim can no longer remove a lock another process has just taken, and a lock is only released by its owner.
+- Untracked files, `--file` attachments and diffs that contain a code fence no longer break the prompt's own fences.
+- `/grok-setup` asks the CLI whether it is logged in instead of trusting a non-empty `auth.json`.
+- A job cancelled before it started reports that instead of crashing.
+
+### Changed
+
+- Finished jobs are capped at 50 per workspace, and `companion.jsonl` rotates at 1 MB.
+- Removed the unused per-workspace config helpers.
+
 ## [0.6.2] — 2026-10-19
 
 ### Fixed

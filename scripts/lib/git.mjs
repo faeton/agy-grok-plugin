@@ -190,13 +190,16 @@ function describeUntracked(cwd, f, budget) {
   }
   const { body, binary } = readHead(abs, MAX_FILE_BYTES);
   if (binary) return { text: `Untracked file ${f}: (binary, skipped)`, bytes: 0 };
-  return { text: [`Untracked file ${f}:`, "```", body, "```"].join("\n"), bytes: st.size };
+  const fc = fence(body);
+  return { text: [`Untracked file ${f}:`, fc, body, fc].join("\n"), bytes: st.size };
 }
 
 // A code fence longer than any backtick run in the body, so a file that itself
-// contains ``` cannot close the block early.
+// contains ``` cannot close the block early. A loop, not Math.max(...runs): a
+// large diff can hold more backtick runs than a call can take arguments.
 function fence(body) {
-  const longest = Math.max(2, ...(body.match(/`+/g) ?? []).map((r) => r.length));
+  let longest = 2;
+  for (const run of body.match(/`+/g) ?? []) if (run.length > longest) longest = run.length;
   return "`".repeat(longest + 1);
 }
 
@@ -289,7 +292,8 @@ export function collectReviewContext(cwd, target) {
     if (log.trim()) {
       sections.push("", "Commits on this branch:", "```", log.trim(), "```");
     }
-    sections.push("", "Diff:", "```diff", diff.trim() || "(no diff)", "```");
+    const fc = fence(diff);
+    sections.push("", "Diff:", `${fc}diff`, diff.trim() || "(no diff)", fc);
     const files = nulList(
       gitOrThrow(["diff", "--name-only", "-z", "--diff-filter=d", "--end-of-options", `${base}...HEAD`], cwd),
     );
@@ -312,18 +316,25 @@ export function collectReviewContext(cwd, target) {
   // -z: NUL-separated and unquoted. Without it git C-quotes names containing
   // spaces, tabs, newlines or non-ASCII bytes, and those quoted strings are not
   // real paths — such files silently vanished from the review.
+  //
+  // Listed from the top level: `ls-files --others` only covers the directory it
+  // runs in, while the diffs and the dirty check cover the whole repository, so
+  // a review started in a subdirectory used to miss new files elsewhere and
+  // could report "no changes" for a tree that had them.
   let hasUntracked = false;
   const budget = { left: MAX_UNTRACKED_BYTES };
-  const untracked = gitOrThrow(["ls-files", "-z", "--others", "--exclude-standard"], cwd);
+  const top = gitOrThrow(["rev-parse", "--show-toplevel"], cwd).trim();
+  const untracked = gitOrThrow(["ls-files", "-z", "--others", "--exclude-standard"], top);
   for (const f of untracked.split("\0").filter(Boolean)) {
-    const section = describeUntracked(cwd, f, budget);
+    const section = describeUntracked(top, f, budget);
     if (!section) continue;
     hasUntracked = true;
     budget.left -= section.bytes;
     sections.push("", section.text);
   }
 
-  sections.push("", "Diff:", "```diff", diff.trim() || "(no tracked diff)", "```");
+  const fc = fence(diff);
+  sections.push("", "Diff:", `${fc}diff`, diff.trim() || "(no tracked diff)", fc);
   const changed = new Set([
     ...nulList(gitOrThrow(["diff", "--cached", "--name-only", "-z", "--diff-filter=d"], cwd)),
     ...nulList(gitOrThrow(["diff", "--name-only", "-z", "--diff-filter=d"], cwd)),
@@ -392,7 +403,8 @@ export function buildConsultPrompt({ question, files = [], cwd = process.cwd() }
     const { size, body } = readHead(abs, MAX_FILE_BYTES);
     const clipped =
       size > MAX_FILE_BYTES ? body + `\n… (truncated, ${size} bytes total)` : body;
-    parts.push("", `--- ${f} ---`, "```", clipped, "```");
+    const fc = fence(clipped);
+    parts.push("", `--- ${f} ---`, fc, clipped, fc);
   }
   parts.push("", CONSULT_METHOD);
   return parts.join("\n");

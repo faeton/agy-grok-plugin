@@ -24,7 +24,7 @@
 //   cancel [job-id] [--json]
 
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -63,7 +63,7 @@ import {
   nowIso,
   transition,
 } from "./lib/jobs.mjs";
-import { ROOT, listJobs, pidMatches, readJobFile, resolveWorkspaceRoot } from "./lib/state.mjs";
+import { ROOT, listJobs, pidMatches, readJobFile, resolveWorkspaceRoot, withLock } from "./lib/state.mjs";
 import {
   renderCancel,
   renderConsultResult,
@@ -81,9 +81,28 @@ const SCRIPT_PATH = fileURLToPath(import.meta.url);
 // checkout, that put a log file in the user's repo.
 const LOG_PATH = join(ROOT, "companion.jsonl");
 
+// The event log is rotated once it passes this size, keeping one old file.
+const LOG_MAX_BYTES = 1_000_000;
+
 function logEvent(event) {
   try {
     mkdirSync(dirname(LOG_PATH), { recursive: true });
+    try {
+      if (statSync(LOG_PATH).size > LOG_MAX_BYTES) {
+        // Size is checked again under a lock: two companions that both saw an
+        // oversized log would otherwise rotate twice, and the second rename
+        // replaced the archive with the new, nearly empty log.
+        withLock(
+          `${LOG_PATH}.lock`,
+          () => {
+            if (statSync(LOG_PATH).size > LOG_MAX_BYTES) renameSync(LOG_PATH, `${LOG_PATH}.1`);
+          },
+          { timeoutMs: 200 },
+        );
+      }
+    } catch {
+      /* no log yet, or another companion is rotating it */
+    }
     appendFileSync(
       LOG_PATH,
       JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...event }) + "\n",
@@ -105,7 +124,11 @@ function normalizeArgv(argv) {
   if (argv.length === 1 && typeof argv[0] === "string") {
     const trimmed = argv[0].trim();
     if (!trimmed) return [];
-    // A single blob from "$ARGUMENTS": split it shell-style.
+    // A single blob from "$ARGUMENTS" is split shell-style, but only when it
+    // carries flags. Plain text (a question, a job id, focus text) stays as it
+    // was typed: splitting it read the apostrophe in "doesn't" as a quote and
+    // dropped backslashes.
+    if (!/(^|\s)-/.test(trimmed)) return [trimmed];
     return splitRawArgumentString(argv[0]);
   }
   return argv;
@@ -312,6 +335,7 @@ async function handleConsult(argv) {
 
   installCancelHandlers(workspaceRoot, job.id);
   const execution = await runTrackedJob(job, (progress) => runConsult(req, progress));
+  if (!execution) return reportNotStarted(job, req.json);
   out(execution.payload, req.json, execution.rendered);
   if (!execution.ok) process.exitCode = execution.exitCode || 1;
 }
@@ -355,12 +379,13 @@ async function runReview(req, kind, progress) {
   const target = resolveReviewTarget(req.cwd, { base: req.base, scope: req.scope });
   const context = collectReviewContext(req.cwd, target);
   if (context.empty) {
+    // Nothing to review is an answer, not a failure: the job completes and the
+    // command exits 0. (`exitCode: 0` on a failed result still exited 1.)
     return {
-      ok: false,
+      ok: true,
       exitCode: 0,
-      errorMessage: "No changes detected to review.",
       summary: "nothing to review",
-      payload: { ok: false, errorMessage: "No changes detected to review.", target },
+      payload: { ok: true, empty: true, text: "No changes detected to review.", target },
       rendered: "[grok] No changes detected to review.\n",
     };
   }
@@ -449,6 +474,7 @@ async function handleReview(argv, kind = "review") {
 
   installCancelHandlers(workspaceRoot, job.id);
   const execution = await runTrackedJob(job, (progress) => runReview(req, kind, progress));
+  if (!execution) return reportNotStarted(job, req.json);
   out(execution.payload, req.json, execution.rendered);
   if (!execution.ok) process.exitCode = execution.exitCode || 1;
 }
@@ -610,6 +636,18 @@ async function handleCancel(argv) {
 }
 
 // ---------- shared ----------
+
+// runTrackedJob returns null when the job left `queued` before it could start
+// (cancelled in the gap after it was created).
+function reportNotStarted(job, asJson) {
+  const status = readJobFile(job.workspaceRoot, job.id)?.status ?? "cancelled";
+  out(
+    { jobId: job.id, status, ok: false, errorMessage: `Job was ${status} before it started.` },
+    asJson,
+    `[grok] ${job.title} was ${status} before it started.\n`,
+  );
+  process.exitCode = 130;
+}
 
 function ensureGrokReady() {
   const grok = getGrokAvailability();

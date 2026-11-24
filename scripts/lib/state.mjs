@@ -1,4 +1,4 @@
-// On-disk job registry + config for the Grok companion.
+// On-disk job registry for the Grok companion.
 //
 // State lives OUTSIDE the user's repo (so consult/review never dirty the working
 // tree) under ~/.grok/companion/<workspace-slug>/:
@@ -6,7 +6,6 @@
 //   logs/<id>.log    human-readable progress log
 //   index.json       lightweight list of all jobs (newest-relevant fields)
 //   state.lock       guards every job-file + index write for the workspace
-//   config.json      per-workspace config (e.g. default model)
 //
 // GROK_COMPANION_HOME overrides the ~/.grok/companion root (used by the tests).
 
@@ -110,9 +109,11 @@ function writeJson(path, value) {
 // happen. Holds are a few milliseconds, so the 5s budget only runs out if
 // something is badly wrong — and then failing loudly beats corrupting state.
 //
-// A stale lock (dead owner, or older than maxAgeMs) is reclaimed by renaming it
-// aside rather than unlinking it: only one contender's rename can succeed, so
-// two processes cannot both "reclaim" and then both write.
+// A stale lock (dead owner, or older than maxAgeMs) is removed under a second
+// guard file, with staleness checked again once the guard is held. Renaming the
+// lock aside was not enough: a contender that had judged the OLD lock stale
+// could rename away the fresh lock another contender had just taken, and both
+// then wrote.
 export function withLock(lockPath, fn, { timeoutMs = 5_000, waitMs = 10, maxAgeMs = 30_000 } = {}) {
   const deadline = Date.now() + timeoutMs;
   let fd = null;
@@ -124,16 +125,7 @@ export function withLock(lockPath, fn, { timeoutMs = 5_000, waitMs = 10, maxAgeM
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
     }
-    if (lockIsStale(lockPath, maxAgeMs)) {
-      const aside = `${lockPath}.stale.${process.pid}.${Math.random().toString(36).slice(2)}`;
-      try {
-        renameSync(lockPath, aside);
-        unlinkSync(aside);
-      } catch {
-        /* another contender reclaimed it first */
-      }
-      continue;
-    }
+    if (lockIsStale(lockPath, maxAgeMs)) reclaimStaleLock(lockPath, maxAgeMs);
     if (Date.now() >= deadline) {
       throw new Error(`Timed out waiting for the job-state lock (${lockPath}).`);
     }
@@ -143,8 +135,44 @@ export function withLock(lockPath, fn, { timeoutMs = 5_000, waitMs = 10, maxAgeM
     return fn();
   } finally {
     closeSync(fd);
+    // Release only a lock that is still ours. If it was reclaimed while we
+    // held it (we were suspended past maxAgeMs), the path now belongs to the
+    // next holder and unlinking it would let a third process in.
     try {
-      unlinkSync(lockPath);
+      if (readFileSync(lockPath, "utf8").trim() === String(process.pid)) unlinkSync(lockPath);
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+// How long a reclaim guard may sit before it is taken for abandoned. A guard is
+// held for a stat, a read and an unlink.
+const RECLAIM_GUARD_MAX_AGE_MS = 5_000;
+
+function reclaimStaleLock(lockPath, maxAgeMs) {
+  const guard = `${lockPath}.reclaim`;
+  let fd;
+  try {
+    fd = openSync(guard, "wx");
+  } catch (err) {
+    if (err.code !== "EEXIST") throw err;
+    // Someone else is reclaiming. Clear the guard only if its holder crashed.
+    try {
+      if (Date.now() - statSync(guard).mtimeMs > RECLAIM_GUARD_MAX_AGE_MS) unlinkSync(guard);
+    } catch {
+      /* already gone */
+    }
+    return;
+  }
+  try {
+    if (lockIsStale(lockPath, maxAgeMs)) unlinkSync(lockPath);
+  } catch {
+    /* already gone */
+  } finally {
+    closeSync(fd);
+    try {
+      unlinkSync(guard);
     } catch {
       /* already gone */
     }
@@ -217,7 +245,7 @@ export function listJobs(workspaceRoot) {
 // snapshot taken earlier), then write the file and its index row together.
 // `mutate` returns null to leave the job untouched. Returns
 // { job, changed } where job is the record now on disk.
-export function updateJob(workspaceRoot, jobId, mutate) {
+export function updateJob(workspaceRoot, jobId, mutate, lockOptions) {
   return withLock(stateLockPath(workspaceRoot), () => {
     const current = readJobFile(workspaceRoot, jobId);
     const next = mutate(current);
@@ -230,6 +258,30 @@ export function updateJob(workspaceRoot, jobId, mutate) {
     index.jobs[jobId] = pickIndexFields(record);
     writeJson(path, index);
     return { job: record, changed: true };
+  }, lockOptions);
+}
+
+// Delete jobs chosen by `select` (index rows in, ids out): job file, log file
+// and index row, under the workspace lock. Returns the ids removed.
+export function removeJobs(workspaceRoot, select) {
+  return withLock(stateLockPath(workspaceRoot), () => {
+    const path = indexPath(workspaceRoot);
+    const index = readJson(path, { jobs: {} });
+    index.jobs ??= {};
+    const ids = select(Object.values(index.jobs)).filter((id) => Object.hasOwn(index.jobs, id));
+    if (!ids.length) return [];
+    for (const id of ids) {
+      delete index.jobs[id];
+      for (const file of [jobFilePath(workspaceRoot, id), logFilePath(workspaceRoot, id)]) {
+        try {
+          unlinkSync(file);
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+    writeJson(path, index);
+    return ids;
   });
 }
 
@@ -254,21 +306,4 @@ export function pidMatches(pid, needle) {
   });
   if (res.status !== 0) return false;
   return res.stdout.includes(needle);
-}
-
-// ----- config -----
-
-function configPath(workspaceRoot) {
-  return join(ensureDir(stateDir(workspaceRoot)), "config.json");
-}
-
-export function getConfig(workspaceRoot) {
-  return readJson(configPath(workspaceRoot), {});
-}
-
-export function setConfig(workspaceRoot, key, value) {
-  const config = getConfig(workspaceRoot);
-  config[key] = value;
-  writeJson(configPath(workspaceRoot), config);
-  return config;
 }

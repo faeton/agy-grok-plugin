@@ -288,6 +288,21 @@ async function effortFor(name, req, env = {}) {
   const mod = await import(`${LIB}?effort=${name}`);
   return mod.effortArgs(req);
 }
+// Auth: the CLI's own banner beats the auth.json heuristic.
+writeFileSync(join(home, "auth.json"), JSON.stringify({ session: { token: "t" } }));
+async function authFor(name, banner) {
+  const fake = join(DIR, `${name}-auth.sh`);
+  writeFileSync(fake, `#!/bin/sh\necho "${banner}"\n`);
+  chmodSync(fake, 0o755);
+  process.env.GROK_BIN = fake;
+  process.env.GROK_HOME = home;
+  const mod = await import(`${LIB}?auth=${name}`);
+  return mod.getGrokAuthStatus().loggedIn;
+}
+check("an expired session is not 'logged in' just because auth.json exists", (await authFor("expired", "You are not authenticated.")) === false, null);
+check("the CLI's logged-in banner is trusted", (await authFor("in", "You are logged in with grok.com.")) === true, null);
+check("a CLI that says neither falls back to auth.json", (await authFor("silent", "Default model: m-yes")) === true, null);
+
 let e = await effortFor("default", {});
 check("default effort is low", e.args.join(" ") === "--effort low", e);
 e = await effortFor("explicit", { effort: "high" });

@@ -8,7 +8,7 @@
 //   node plugins/grok/scripts/test/state.test.mjs
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,9 +18,9 @@ process.env.GROK_COMPANION_HOME = join(DIR, "companion");
 delete process.env.GROK_COMPANION_SESSION_ID;
 
 const LIB = resolve(dirname(fileURLToPath(import.meta.url)), "..", "lib");
-const { parseArgs } = await import(join(LIB, "args.mjs"));
+const { parseArgs, splitRawArgumentString } = await import(join(LIB, "args.mjs"));
 const { collectReviewContext, resolveReviewTarget } = await import(join(LIB, "git.mjs"));
-const { createJob, reconcile, runTrackedJob, transition, START_GRACE_MS } = await import(
+const { createJob, pruneJobs, reconcile, runTrackedJob, transition, START_GRACE_MS } = await import(
   join(LIB, "jobs.mjs")
 );
 const { listJobs, readJobFile, updateJob, withLock } = await import(join(LIB, "state.mjs"));
@@ -63,6 +63,13 @@ parsed = parseArgs(["-m", "grok-x", "--", "--not-a-flag", "text"], CONFIG);
 check("everything after -- is positional", parsed.positionals.join(" ") === "--not-a-flag text", parsed);
 check("negative numbers are values, not flags", parseArgs(["--scope", "-1"], CONFIG).options.scope === "-1", null);
 
+let split = splitRawArgumentString(`--model x why doesn't C:\\temp work`);
+check("an apostrophe inside a word is text", split.join(" ") === `--model x why doesn't C:\\temp work`, split);
+split = splitRawArgumentString(`--file src/'my file.ts' -- explain`);
+check("a quoted segment inside a token still groups", split[1] === "src/my file.ts", split);
+split = splitRawArgumentString(`--file "my file.ts" --question='a b' it\\'s`);
+check("quotes and escaped quotes still group", JSON.stringify(split) === JSON.stringify(["--file", "my file.ts", "--question=a b", "it's"]), split);
+
 // ----------------------------------------------------------------------- git
 
 console.log("\nreview context");
@@ -99,6 +106,20 @@ const onlyQuoted = makeRepo("quoted");
 writeFileSync(join(onlyQuoted, "only new file.ts"), "content\n");
 ctx = collectReviewContext(onlyQuoted, { mode: "working-tree" });
 check("a tree whose only change is a quoted name is not 'empty'", ctx.empty === false, ctx);
+
+const nested = makeRepo("nested");
+mkdirSync(join(nested, "a", "b"), { recursive: true });
+writeFileSync(join(nested, "a", "elsewhere.ts"), "outside the cwd\n");
+ctx = collectReviewContext(join(nested, "a", "b"), { mode: "working-tree" });
+check("an untracked file outside the cwd is still reviewed", ctx.empty === false && ctx.content.includes("outside the cwd"), ctx);
+
+const ticks = makeRepo("ticks");
+writeFileSync(join(ticks, "notes.md"), "before\n```\ninside\n```\nafter\n");
+ctx = collectReviewContext(ticks, { mode: "working-tree" });
+check("an untracked file holding ``` gets a longer fence", ctx.content.includes("Untracked file notes.md:\n````\nbefore"), ctx.content);
+g(ticks, "add", ".");
+ctx = collectReviewContext(ticks, { mode: "working-tree" });
+check("a diff holding ``` gets a longer fence", ctx.content.includes("Diff:\n````diff\n"), ctx.content);
 
 check(
   "--base starting with - is rejected",
@@ -215,6 +236,32 @@ const afterCancel = readJobFile(ws, job.id);
 check("a finish after cancel keeps the cancellation", afterCancel.status === "cancelled", afterCancel);
 check("a finish after cancel keeps the output", afterCancel.rendered === "late output\n", afterCancel);
 check("runTrackedJob still returns the execution", exec.ok === true, exec);
+
+job = newJob();
+const survived = await runTrackedJob({ ...job, workspaceRoot: ws }, async (progress) => {
+  // The lock is held by a live process, so the progress write times out.
+  const statePath = join(dirname(readJobFile(ws, job.id).logFile), "..", "state.lock");
+  writeFileSync(statePath, String(process.pid));
+  const t0 = Date.now();
+  progress({ phase: "asking" });
+  unlinkSync(statePath);
+  return { ok: true, payload: { text: "a" }, rendered: "a\n", waited: Date.now() - t0 };
+});
+check("a failed progress write does not throw into the run", survived?.ok === true && readJobFile(ws, job.id).status === "completed", survived);
+
+const pruneWs = join(DIR, "prune-ws");
+mkdirSync(pruneWs);
+const mk = () => createJob({ workspaceRoot: pruneWs, kind: "consult", title: "T", prefix: "t", request: {} });
+const done = [mk(), mk(), mk()];
+for (const j of done) {
+  transition(pruneWs, j.id, ["queued"], { status: "completed" });
+  await new Promise((r) => setTimeout(r, 5)); // distinct updatedAt, so "newest" is defined
+}
+const active = mk();
+const removed = pruneJobs(pruneWs, 1);
+const left = listJobs(pruneWs).map((j) => j.id);
+check("pruning keeps the newest finished job and every active one", removed.length === 2 && left.length === 2 && left.includes(active.id) && left.includes(done[2].id), { removed, left });
+check("pruning deletes the job file and its log", readJobFile(pruneWs, done[0].id) === null && !existsSync(done[0].logFile), null);
 
 // ---------------------------------------------------------------------- lock
 
